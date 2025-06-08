@@ -101,7 +101,7 @@ if __name__ == '__main__':
      # Initialize the Trainer and the DataModule
      trainer = pl.Trainer(
           **vars(arg_groups['Trainer']),
-          strategy="ddp", logger=logger,
+          strategy="auto", logger=logger,
           log_every_n_steps=10, num_sanity_val_steps=0,
           callbacks=callbacks
      )

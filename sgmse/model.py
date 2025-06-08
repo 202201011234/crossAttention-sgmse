@@ -108,7 +108,7 @@ class ScoreModel(pl.LightningModule):
     def on_save_checkpoint(self, checkpoint):
         checkpoint['ema'] = self.ema.state_dict()
 
-    def train(self, mode, no_ema=False):
+    def train(self, mode=True, no_ema=False):
         res = super().train(mode)  # call the standard `train` method with the given mode
         if not self._error_loading_ema:
             if mode == False and not no_ema:
