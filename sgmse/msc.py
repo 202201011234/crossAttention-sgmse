@@ -33,6 +33,10 @@ class MSC(nn.Module):
         self.topk = topk # False True
 
     def forward(self, x,y):
+        # 保存输入x的原始空间维度
+        original_h, original_w = x.shape[-2], x.shape[-1]
+        self._original_hw = (original_h, original_w)
+        
         # x0 = x
         y1 = self.avgpool1(y)
         y2 = self.avgpool2(y)
@@ -118,8 +122,55 @@ class MSC(nn.Module):
    
         x = self.proj(x)
         x = self.proj_drop(x)
-        hw = int(sqrt(N))
-        x = rearrange(x,'b (h w) c -> b c h w',h=hw,w=hw)
+        
+        # 动态计算h和w，确保h * w = N
+        # 找到最接近sqrt(N)的整数h，使得h * w = N
+        h = int(sqrt(N))
+        while h > 0 and N % h != 0:
+            h -= 1
+        w = N // h if h > 0 else 1
+        
+        # 如果找不到合适的h和w，使用更智能的搜索
+        if h * w != N:
+            # 尝试找到最接近的h和w组合
+            best_h, best_w = h, w
+            min_diff = abs(h * w - N)
+            
+            # 在sqrt(N)附近搜索更好的组合
+            for candidate_h in range(max(1, int(sqrt(N)) - 2), int(sqrt(N)) + 3):
+                if candidate_h > 0 and N % candidate_h == 0:
+                    candidate_w = N // candidate_h
+                    diff = abs(candidate_h * candidate_w - N)
+                    if diff < min_diff:
+                        best_h, best_w = candidate_h, candidate_w
+                        min_diff = diff
+            
+            h, w = best_h, best_w
+            
+            # 如果仍然不匹配，使用最接近的方形
+            if h * w != N:
+                # 使用最接近的方形尺寸
+                target_size = int(sqrt(N)) ** 2
+                if target_size < N:
+                    # 向上取整到下一个完全平方数
+                    target_size = (int(sqrt(N)) + 1) ** 2
+                
+                # 使用padding到目标尺寸
+                if target_size > N:
+                    padding_size = target_size - N
+                    x = torch.cat([x, torch.zeros(B, padding_size, x.shape[-1], device=x.device)], dim=1)
+                    N = target_size  # 更新N为新的序列长度
+                    h = w = int(sqrt(target_size))  # 更新h和w为方形尺寸
+        
+        x = rearrange(x,'b (h w) c -> b c h w',h=h,w=w)
+        
+        # 确保输出张量的空间维度与输入相同
+        # 获取输入x的原始空间维度
+        if hasattr(self, '_original_hw'):
+            original_h, original_w = self._original_hw
+            # 如果输出维度与输入不同，使用插值调整到相同维度
+            if x.shape[-2] != original_h or x.shape[-1] != original_w:
+                x = torch.nn.functional.interpolate(x, size=(original_h, original_w), mode='bilinear', align_corners=False)
         # x = x + x0
         return x
     
