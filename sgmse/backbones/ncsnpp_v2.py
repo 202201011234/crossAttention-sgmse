@@ -238,7 +238,7 @@ class NCSNpp_v2(nn.Module):
         self.all_modules = nn.ModuleList(modules)
         
 
-    def forward(self, x, y, t):
+    def forward(self, x, y, t, c_bottleneck=None, msc_bottleneck=None):
         # timestep/noise_level embedding; only for continuous training
         modules = self.all_modules
         m_idx = 0
@@ -312,6 +312,17 @@ class NCSNpp_v2(nn.Module):
                 hs.append(h)
 
         h = hs[-1] # actualy equal to: h = h
+        
+        # --- [MSC 缝合开始] ---
+        # 如果提供了 c_bottleneck 和 msc_bottleneck，则在瓶颈处应用 MSC
+        if c_bottleneck is not None and msc_bottleneck is not None:
+            # 将 h (来自 x_t) 作为 Query，c_bottleneck (来自 y) 作为 Key/Value
+            h_conditioned = msc_bottleneck(x=h, y=c_bottleneck)
+            
+            # 使用残差连接，将 MSC 的输出加回 h
+            h = h + h_conditioned
+        # --- [MSC 缝合结束] ---
+        
         h = modules[m_idx](h, temb)  # ResNet block
         m_idx += 1
         h = modules[m_idx](h)  # Attention block

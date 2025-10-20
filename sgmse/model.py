@@ -18,6 +18,50 @@ from pesq import pesq
 from pystoi import stoi
 from torch_pesq import PesqLoss
 
+from .backbones.ncsnpp_utils import layerspp, layers
+ResnetBlock = layerspp.ResnetBlockBigGANpp
+Downsample = layerspp.Downsample 
+from .msc import MSC
+import torch.nn as nn 
+
+class ConditioningEncoder(nn.Module): 
+    def __init__(self, n_channels=32, n_blocks=4): 
+        super().__init__() 
+        # 假设原始 y 是 (B, 2, H, W) 
+        self.init_conv = nn.Conv2d(2, n_channels, 3, 1, 1) 
+        
+        self.down = nn.ModuleList() 
+        channels = [n_channels] 
+        
+        # 镜像 ScoreModel 的下采样路径 
+        for i in range(n_blocks): 
+            self.down.append( 
+                nn.ModuleList( 
+                    [ 
+                        ResnetBlock(n_channels, n_channels), 
+                        ResnetBlock(n_channels, n_channels), 
+                        Downsample(n_channels), 
+                    ] 
+                ) 
+            ) 
+            channels.append(n_channels) 
+            n_channels *= 2 
+            
+        self.n_blocks = n_blocks 
+
+    def forward(self, y): 
+        # y 的 shape 预期为 (B, 2, H, W) 
+        c = self.init_conv(y) 
+        
+        # 只执行下采样 
+        for i in range(self.n_blocks): 
+            c, _, _ = self.down[i][0](c, None) # ResnetBlock 1 
+            c, _, _ = self.down[i][1](c, None) # ResnetBlock 2 
+            c, _ = self.down[i][2](c)          # Downsample 
+        
+        # 返回瓶颈处的条件特征 
+        return c
+
 
 class ScoreModel(pl.LightningModule):
     @staticmethod
@@ -86,6 +130,19 @@ class ScoreModel(pl.LightningModule):
                 param.requires_grad = False
         self.save_hyperparameters(ignore=['no_wandb'])
         self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
+        
+        # 实例化条件编码器 
+        self.condition_encoder = ConditioningEncoder(n_channels=32, n_blocks=4) 
+        
+        # 实例化用于瓶颈的 MSC 模块 
+        # 假设瓶颈通道数为 1024 (根据 ncsnpp_v2.py 的默认配置) 
+        bottleneck_dim = 1024 
+        self.msc_bottleneck = MSC( 
+            dim=bottleneck_dim, 
+            num_heads=8,  # 你可以根据需要调整 num_heads 
+            k1=2, 
+            k2=3 
+        )
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
@@ -205,8 +262,14 @@ class ScoreModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         # Evaluate speech enhancement performance
         if batch_idx == 0 and self.num_eval_files != 0:
-            rank = dist.get_rank()
-            world_size = dist.get_world_size()
+            # Check if distributed training is initialized
+            try:
+                rank = dist.get_rank()
+                world_size = dist.get_world_size()
+            except (RuntimeError, ValueError):
+                # Fallback for non-distributed training (single GPU)
+                rank = 0
+                world_size = 1
 
             # Split the evaluation files among the GPUs
             eval_files_per_gpu = self.num_eval_files // world_size
@@ -282,7 +345,15 @@ class ScoreModel(pl.LightningModule):
 
         # In [3], we use new code with backbone='ncsnpp_v2':
         if self.backbone == "ncsnpp_v2":
-            F = self.dnn(self._c_in(t) * x_t, self._c_in(t) * y, t)
+            # --- [MSC 缝合开始] ---
+            # 1. 使用 ConditionEncoder 处理带噪语音 y，得到瓶颈处的条件特征 c
+            #    将 y 转换为实数形式，因为 ConditionEncoder 期望实数输入
+            y_real = torch.cat((y.real, y.imag), dim=1)  # (B, 2, H, W)
+            c_bottleneck = self.condition_encoder(y_real)
+            
+            # 2. 调用修改版的 dnn forward，传入 c_bottleneck
+            F = self.dnn(self._c_in(t) * x_t, self._c_in(t) * y, t, c_bottleneck, self.msc_bottleneck)
+            # --- [MSC 缝合结束] ---
             
             # Scaling the network output, see below Eq. (7) in the paper
             if self.network_scaling == "1/sigma":
