@@ -85,18 +85,74 @@ if __name__ == '__main__':
 
      # Set up callbacks for logger
      if logger != None:
-          callbacks = [ModelCheckpoint(dirpath=join(args.log_dir, str(logger.version)), save_last=True, 
-               filename='{epoch}-last')]
-          callbacks += [ModelCheckpoint(dirpath=join(args.log_dir, f'{str(logger.version)}-{args.wandb_name}'),
-               filename='{step}', save_top_k=-1, every_n_train_steps=args.save_ckpt_interval)]
+          callbacks = []
+          
+          # 1. 保存最后一个epoch的模型
+          last_epoch_checkpoint = ModelCheckpoint(
+               dirpath=join(args.log_dir, str(logger.version)), 
+               save_last=True,
+               filename='last-epoch-{epoch}'
+          )
+          callbacks.append(last_epoch_checkpoint)
+          
+          # 2. 保存PESQ指标最优的模型
           if args.num_eval_files:
-               checkpoint_callback_pesq = ModelCheckpoint(dirpath=join(args.log_dir, str(logger.version)), 
-                    save_top_k=1, monitor="pesq", mode="max", filename='{epoch}-{pesq:.2f}')
-               checkpoint_callback_si_sdr = ModelCheckpoint(dirpath=join(args.log_dir, str(logger.version)), 
-                    save_top_k=1, monitor="si_sdr", mode="max", filename='{epoch}-{si_sdr:.2f}')
-               callbacks += [checkpoint_callback_pesq, checkpoint_callback_si_sdr]
+               pesq_checkpoint = ModelCheckpoint(
+                    dirpath=join(args.log_dir, str(logger.version)), 
+                    save_top_k=1, 
+                    monitor="pesq", 
+                    mode="max", 
+                    filename='best-pesq-{epoch}-{pesq:.3f}',
+                    every_n_epochs=1  # 每个epoch结束后检查
+               )
+               callbacks.append(pesq_checkpoint)
+               
+               # 3. 保存STOI指标最优的模型
+               stoi_checkpoint = ModelCheckpoint(
+                    dirpath=join(args.log_dir, str(logger.version)), 
+                    save_top_k=1, 
+                    monitor="estoi", 
+                    mode="max", 
+                    filename='best-stoi-{epoch}-{estoi:.3f}',
+                    every_n_epochs=1  # 每个epoch结束后检查
+               )
+               callbacks.append(stoi_checkpoint)
+          
+          # 4. 按训练步数保存检查点（可选）
+          if args.save_ckpt_interval > 0:
+               step_checkpoint = ModelCheckpoint(
+                    dirpath=join(args.log_dir, f'{str(logger.version)}-{args.wandb_name}'),
+                    filename='{step}', 
+                    save_top_k=-1, 
+                    every_n_train_steps=args.save_ckpt_interval
+               )
+               callbacks.append(step_checkpoint)
      else:
-          callbacks = None
+          # 如果没有logger，使用基本检查点配置
+          callbacks = [
+               ModelCheckpoint(
+                    dirpath=join(args.log_dir, 'checkpoints'), 
+                    save_last=True,
+                    filename='last-epoch-{epoch}'
+               )
+          ]
+          if args.num_eval_files:
+               callbacks.append(ModelCheckpoint(
+                    dirpath=join(args.log_dir, 'checkpoints'), 
+                    save_top_k=1, 
+                    monitor="pesq", 
+                    mode="max", 
+                    filename='best-pesq-{epoch}-{pesq:.3f}',
+                    every_n_epochs=1
+               ))
+               callbacks.append(ModelCheckpoint(
+                    dirpath=join(args.log_dir, 'checkpoints'), 
+                    save_top_k=1, 
+                    monitor="estoi", 
+                    mode="max", 
+                    filename='best-stoi-{epoch}-{estoi:.3f}',
+                    every_n_epochs=1
+               ))
 
      # Initialize the Trainer and the DataModule
      trainer = pl.Trainer(

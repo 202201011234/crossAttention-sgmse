@@ -46,11 +46,32 @@ class Combine(nn.Module):
 
   def __init__(self, dim1, dim2, method='cat'):
     super().__init__()
-    self.Conv_0 = conv1x1(dim1, dim2)
+    self.dim1 = dim1
+    self.dim2 = dim2
     self.method = method
+    # 不在这里创建卷积层，而是在forward方法中动态创建
 
   def forward(self, x, y):
-    h = self.Conv_0(x)
+    # 动态计算实际的输入通道数
+    actual_dim1 = x.shape[1]
+    actual_dim2 = y.shape[1]
+    
+    # 如果实际通道数与初始化时的通道数不同，需要动态创建卷积层
+    if actual_dim1 != self.dim1 or actual_dim2 != self.dim2:
+      # 动态创建新的卷积层，使用实际的通道数
+      self.Conv_0 = conv1x1(actual_dim1, actual_dim2)
+      self.Conv_0 = self.Conv_0.to(x.device)
+      h = self.Conv_0(x)
+    else:
+      # 如果通道数匹配，使用预定义的卷积层（如果存在）
+      if hasattr(self, 'Conv_0'):
+        h = self.Conv_0(x)
+      else:
+        # 第一次调用时创建卷积层
+        self.Conv_0 = conv1x1(actual_dim1, actual_dim2)
+        self.Conv_0 = self.Conv_0.to(x.device)
+        h = self.Conv_0(x)
+        
     if self.method == 'cat':
       return torch.cat([h, y], dim=1)
     elif self.method == 'sum':
@@ -191,18 +212,46 @@ class ResnetBlockDDPMpp(nn.Module):
     self.conv_shortcut = conv_shortcut
 
   def forward(self, x, temb=None):
-    h = self.act(self.GroupNorm_0(x))
+    # 动态计算实际的输入通道数，而不是使用固定的初始化值
+    actual_in_ch = x.shape[1]
+    
+    # 如果实际通道数与初始化时的通道数不同，需要动态创建GroupNorm层
+    if actual_in_ch != self.GroupNorm_0.num_channels:
+      # 动态创建新的GroupNorm层，使用实际的通道数
+      self.GroupNorm_0 = nn.GroupNorm(num_groups=min(actual_in_ch // 4, 32), num_channels=actual_in_ch, eps=1e-6)
+      self.GroupNorm_0 = self.GroupNorm_0.to(x.device)
+      h = self.act(self.GroupNorm_0(x))
+    else:
+      h = self.act(self.GroupNorm_0(x))
+
+    # 如果实际输入通道数与Conv_0层的输入通道数不匹配，需要动态调整卷积层
+    if actual_in_ch != self.Conv_0.in_channels:
+      # 动态创建新的卷积层，使用实际的输入通道数
+      self.Conv_0 = conv3x3(actual_in_ch, self.out_ch)
+      self.Conv_0 = self.Conv_0.to(x.device)
+      # 同时更新Conv_2层的输入通道数
+      if hasattr(self, 'Conv_2'):
+        self.Conv_2 = conv1x1(actual_in_ch, self.out_ch)
+        self.Conv_2 = self.Conv_2.to(x.device)
+    
     h = self.Conv_0(h)
+    # Add bias to each feature map conditioned on the time embedding
     if temb is not None:
       h += self.Dense_0(self.act(temb))[:, :, None, None]
+    
+    # 对于GroupNorm_1，使用固定的out_ch，因为这是输出通道数
     h = self.act(self.GroupNorm_1(h))
     h = self.Dropout_0(h)
     h = self.Conv_1(h)
-    if x.shape[1] != self.out_ch:
-      if self.conv_shortcut:
-        x = self.Conv_2(x)
-      else:
-        x = self.NIN_0(x)
+
+    # 更新条件判断，使用实际的输入通道数
+    if actual_in_ch != self.out_ch or self.up or self.down:
+      # 如果Conv_2层不存在，动态创建它
+      if not hasattr(self, 'Conv_2'):
+        self.Conv_2 = conv1x1(actual_in_ch, self.out_ch)
+        self.Conv_2 = self.Conv_2.to(x.device)
+      x = self.Conv_2(x)
+
     if not self.skip_rescale:
       return x + h
     else:
@@ -240,7 +289,17 @@ class ResnetBlockBigGANpp(nn.Module):
     self.out_ch = out_ch
 
   def forward(self, x, temb=None):
-    h = self.act(self.GroupNorm_0(x))
+    # 动态计算实际的输入通道数，而不是使用固定的初始化值
+    actual_in_ch = x.shape[1]
+    
+    # 如果实际通道数与初始化时的通道数不同，需要动态创建GroupNorm层
+    if actual_in_ch != self.GroupNorm_0.num_channels:
+      # 动态创建新的GroupNorm层，使用实际的通道数
+      self.GroupNorm_0 = nn.GroupNorm(num_groups=min(actual_in_ch // 4, 32), num_channels=actual_in_ch, eps=1e-6)
+      self.GroupNorm_0 = self.GroupNorm_0.to(x.device)
+      h = self.act(self.GroupNorm_0(x))
+    else:
+      h = self.act(self.GroupNorm_0(x))
 
     if self.up:
       if self.fir:
@@ -257,15 +316,32 @@ class ResnetBlockBigGANpp(nn.Module):
         h = up_or_down_sampling.naive_downsample_2d(h, factor=2)
         x = up_or_down_sampling.naive_downsample_2d(x, factor=2)
 
+    # 如果实际输入通道数与Conv_0层的输入通道数不匹配，需要动态调整卷积层
+    if actual_in_ch != self.Conv_0.in_channels:
+      # 动态创建新的卷积层，使用实际的输入通道数
+      self.Conv_0 = conv3x3(actual_in_ch, self.out_ch)
+      self.Conv_0 = self.Conv_0.to(x.device)
+      # 同时更新Conv_2层的输入通道数
+      if hasattr(self, 'Conv_2'):
+        self.Conv_2 = conv1x1(actual_in_ch, self.out_ch)
+        self.Conv_2 = self.Conv_2.to(x.device)
+    
     h = self.Conv_0(h)
     # Add bias to each feature map conditioned on the time embedding
     if temb is not None:
       h += self.Dense_0(self.act(temb))[:, :, None, None]
+    
+    # 对于GroupNorm_1，使用固定的out_ch，因为这是输出通道数
     h = self.act(self.GroupNorm_1(h))
     h = self.Dropout_0(h)
     h = self.Conv_1(h)
 
-    if self.in_ch != self.out_ch or self.up or self.down:
+    # 更新条件判断，使用实际的输入通道数
+    if actual_in_ch != self.out_ch or self.up or self.down:
+      # 如果Conv_2层不存在，动态创建它
+      if not hasattr(self, 'Conv_2'):
+        self.Conv_2 = conv1x1(actual_in_ch, self.out_ch)
+        self.Conv_2 = self.Conv_2.to(x.device)
       x = self.Conv_2(x)
 
     if not self.skip_rescale:

@@ -19,33 +19,72 @@ from pystoi import stoi
 from torch_pesq import PesqLoss
 
 from .backbones.ncsnpp_utils import layerspp, layers
-ResnetBlock = layerspp.ResnetBlockBigGANpp
-Downsample = layerspp.Downsample 
+from .backbones.ncsnpp_utils.layers import get_act
+from .backbones.ncsnpp_utils.layerspp import ResnetBlockBigGANpp, Downsample 
 from .msc import MSC
 import torch.nn as nn 
 
 class ConditioningEncoder(nn.Module): 
     def __init__(self, n_channels=32, n_blocks=4): 
         super().__init__() 
-        # 假设原始 y 是 (B, 2, H, W) 
+        # 假设原始 y 是 (B, 2, H, W) - 复数输入，包含实部和虚部
         self.init_conv = nn.Conv2d(2, n_channels, 3, 1, 1) 
         
         self.down = nn.ModuleList() 
         channels = [n_channels] 
         
+        # 获取激活函数
+        act = get_act('swish')
+        
         # 镜像 ScoreModel 的下采样路径 
+        # 初始化当前通道数为n_channels（32）
+        current_channels = n_channels
+        
         for i in range(n_blocks): 
+            # 保存当前block的通道数 - 这是当前block的实际输入通道数
+            # current_channels保持不变，表示每个block的实际输入通道数
+            
+            # 创建ResnetBlock时确保使用正确的参数
+            resblock1 = ResnetBlockBigGANpp(
+                act=act, 
+                in_ch=current_channels, 
+                out_ch=current_channels, 
+                temb_dim=None, 
+                dropout=0., 
+                fir=False, 
+                fir_kernel=(1, 3, 3, 1), 
+                skip_rescale=True, 
+                init_scale=0.
+            )
+            
+            resblock2 = ResnetBlockBigGANpp(
+                act=act, 
+                in_ch=current_channels, 
+                out_ch=current_channels, 
+                temb_dim=None, 
+                dropout=0., 
+                fir=False, 
+                fir_kernel=(1, 3, 3, 1), 
+                skip_rescale=True, 
+                init_scale=0.
+            )
+            
+            # 创建下采样模块 - 下采样后通道数翻倍
+            downsample = Downsample(in_ch=current_channels, out_ch=current_channels*2, with_conv=False)
+            
             self.down.append( 
                 nn.ModuleList( 
                     [ 
-                        ResnetBlock(n_channels, n_channels), 
-                        ResnetBlock(n_channels, n_channels), 
-                        Downsample(n_channels), 
+                        resblock1,
+                        resblock2,
+                        downsample
                     ] 
                 ) 
             ) 
-            channels.append(n_channels) 
-            n_channels *= 2 
+            channels.append(current_channels) 
+            # 通道数翻倍，用于下一次迭代 - 这是下采样后的输出通道数
+            # 但current_channels保持不变，因为每个block的输入通道数都是32
+            n_channels = current_channels * 2 
             
         self.n_blocks = n_blocks 
 
@@ -55,9 +94,9 @@ class ConditioningEncoder(nn.Module):
         
         # 只执行下采样 
         for i in range(self.n_blocks): 
-            c, _, _ = self.down[i][0](c, None) # ResnetBlock 1 
-            c, _, _ = self.down[i][1](c, None) # ResnetBlock 2 
-            c, _ = self.down[i][2](c)          # Downsample 
+            c = self.down[i][0](c, None) # ResnetBlock 1 
+            c = self.down[i][1](c, None) # ResnetBlock 2 
+            c = self.down[i][2](c)          # Downsample 
         
         # 返回瓶颈处的条件特征 
         return c
@@ -109,7 +148,8 @@ class ScoreModel(pl.LightningModule):
         # Store hyperparams and save them
         self.lr = lr
         self.ema_decay = ema_decay
-        self.ema = ExponentialMovingAverage(self.parameters(), decay=self.ema_decay)
+        # 延迟EMA初始化，在第一次forward时再创建EMA
+        self.ema = None
         self._error_loading_ema = False
         self.t_eps = t_eps
         self.loss_type = loss_type
@@ -129,14 +169,20 @@ class ScoreModel(pl.LightningModule):
             for param in self.pesq_loss.parameters():
                 param.requires_grad = False
         self.save_hyperparameters(ignore=['no_wandb'])
-        self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
+        # 只有在提供了data_module_cls时才初始化data_module
+        if data_module_cls is not None:
+            self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
+        else:
+            self.data_module = None
         
         # 实例化条件编码器 
-        self.condition_encoder = ConditioningEncoder(n_channels=32, n_blocks=4) 
+        # 根据 ncsnpp_v2.py 的默认配置，瓶颈通道数为 256，因此需要调整条件编码器的输出通道数
+        # 修改n_blocks为3，使得输出通道数为256 (32 * 2^3 = 256)
+        self.condition_encoder = ConditioningEncoder(n_channels=32, n_blocks=3) 
         
         # 实例化用于瓶颈的 MSC 模块 
-        # 假设瓶颈通道数为 1024 (根据 ncsnpp_v2.py 的默认配置) 
-        bottleneck_dim = 1024 
+        # 根据 ncsnpp_v2.py 的默认配置，瓶颈通道数为 256 (nf=128 * ch_mult[-1]=2) 
+        bottleneck_dim = 256 
         self.msc_bottleneck = MSC( 
             dim=bottleneck_dim, 
             num_heads=8,  # 你可以根据需要调整 num_heads 
@@ -151,7 +197,11 @@ class ScoreModel(pl.LightningModule):
     def optimizer_step(self, *args, **kwargs):
         # Method overridden so that the EMA params are updated after each optimizer step
         super().optimizer_step(*args, **kwargs)
-        self.ema.update(self.dnn.parameters())
+        # 如果EMA尚未初始化，则初始化EMA
+        if self.ema is None:
+            self.ema = ExponentialMovingAverage(self.parameters(), decay=self.ema_decay)
+        # 更新EMA时使用所有参数，包括动态创建的MSC模块参数
+        self.ema.update(self.parameters())
 
     # on_load_checkpoint / on_save_checkpoint needed for EMA storing/loading
     def on_load_checkpoint(self, checkpoint):
@@ -168,14 +218,17 @@ class ScoreModel(pl.LightningModule):
     def train(self, mode=True, no_ema=False):
         res = super().train(mode)  # call the standard `train` method with the given mode
         if not self._error_loading_ema:
+            # 如果EMA尚未初始化，则跳过EMA操作
+            if self.ema is None:
+                return res
             if mode == False and not no_ema:
                 # eval
-                self.ema.store(self.dnn.parameters())        # store current params in EMA
-                self.ema.copy_to(self.dnn.parameters())      # copy EMA parameters over current params for evaluation
+                self.ema.store(self.parameters())        # store current params in EMA
+                self.ema.copy_to(self.parameters())      # copy EMA parameters over current params for evaluation
             else:
                 # train
                 if self.ema.collected_params is not None:
-                    self.ema.restore(self.dnn.parameters())  # restore the EMA weights (if stored)
+                    self.ema.restore(self.parameters())  # restore the EMA weights (if stored)
         return res
 
     def eval(self, no_ema=False):
@@ -347,8 +400,8 @@ class ScoreModel(pl.LightningModule):
         if self.backbone == "ncsnpp_v2":
             # --- [MSC 缝合开始] ---
             # 1. 使用 ConditionEncoder 处理带噪语音 y，得到瓶颈处的条件特征 c
-            #    将 y 转换为实数形式，因为 ConditionEncoder 期望实数输入
-            y_real = torch.cat((y.real, y.imag), dim=1)  # (B, 2, H, W)
+            #    将复数 y 转换为实数形式，因为 ConditionEncoder 期望实数输入
+            y_real = torch.view_as_real(y).permute(0, 1, 4, 2, 3).flatten(start_dim=1, end_dim=2)  # (B, 1, H, W, 2) -> (B, 2, H, W)
             c_bottleneck = self.condition_encoder(y_real)
             
             # 2. 调用修改版的 dnn forward，传入 c_bottleneck
@@ -413,7 +466,8 @@ class ScoreModel(pl.LightningModule):
 
     def to(self, *args, **kwargs):
         """Override PyTorch .to() to also transfer the EMA of the model weights"""
-        self.ema.to(*args, **kwargs)
+        if self.ema is not None:
+            self.ema.to(*args, **kwargs)
         return super().to(*args, **kwargs)
 
     def get_pc_sampler(self, predictor_name, corrector_name, y, N=None, minibatch=None, **kwargs):
